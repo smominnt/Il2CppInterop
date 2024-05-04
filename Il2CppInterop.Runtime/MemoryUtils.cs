@@ -1,15 +1,25 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using Il2CppInterop.Common;
 using Il2CppInterop.Common.XrefScans;
+using Microsoft.Extensions.Logging;
 using TerraFX.Interop.Windows;
 
 namespace Il2CppInterop.Runtime;
 
 internal class MemoryUtils
 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern bool VirtualProtect(IntPtr lpAddress, uint dwSize, uint flNewProtect, out uint lpflOldProtect);
+
     public static unsafe nint FindSignatureInModule(ProcessModule module, SignatureDefinition sigDef)
     {
         // On newer Unity (6000.x) the loaded GameAssembly maps some pages PAGE_NOACCESS / guard pages; the raw
@@ -100,23 +110,116 @@ internal class MemoryUtils
         return regions;
     }
 
+    public static void RuntimeModuleDump(ILogger logger, out byte[] il2cppBytes, out byte[] metadataBytes, byte[] metadataSignatureToScan, byte[] magicToFix, int metadataSignatureOffset = 252)
+    {
+        Process process = Process.GetCurrentProcess();
+        var module = process
+            .Modules.OfType<ProcessModule>()
+            .Single((x) => x.ModuleName is "GameAssembly.dll" or "GameAssembly.so" or "UserAssembly.dll");
+        if (module.ModuleName == null)
+        {
+            logger.LogError("GameAssembly.dll or GameAssembly.so or UserAssembly.dll not found");
+            il2cppBytes = [];
+            metadataBytes = [];
+            return;
+        }
+        var moduleBytes = new byte[module.ModuleMemorySize];
+
+        // Directly use TerraFX regions without translation projection
+        var regions = GetModuleRegions(module);
+
+        SetModuleRegions(regions, PAGE_EXECUTE_READWRITE);
+        if (!ReadProcessMemory(process.Handle, module.BaseAddress, moduleBytes, module.ModuleMemorySize, out _))
+        {
+            logger.LogError("Failed to read process memory");
+            il2cppBytes = [];
+            metadataBytes = [];
+            return;
+        }
+        SetModuleRegions(regions);
+
+        using (var stream = new MemoryStream(moduleBytes))
+        using (var reader = new BinaryReader(stream))
+        using (var writer = new BinaryWriter(stream))
+        {
+            stream.Position = 0x3C;
+            var peHeaderOffset = reader.ReadInt32();
+            stream.Position = peHeaderOffset + 6;
+            var numberOfSections = reader.ReadUInt16();
+            var sizeOfOptionalHeader = reader.ReadUInt16();
+            var section0StartPosition = (int)stream.Position + sizeOfOptionalHeader;
+
+            for (var i = 0; i < numberOfSections; i++)
+            {
+                stream.Position = section0StartPosition + (i * 40);
+                var virtualSize = reader.ReadUInt32();
+                var virtualAddress = reader.ReadUInt32();
+                writer.Write(virtualSize);
+                writer.Write(virtualAddress);
+            }
+        }
+
+        il2cppBytes = moduleBytes;
+        var byteArray = moduleBytes;
+
+        var index = Array.IndexOf(byteArray, (byte)metadataSignatureToScan[0]);
+        while (index >= 0 && index <= byteArray.Length - metadataSignatureToScan.Length)
+        {
+            if (byteArray.Skip(index).Take(metadataSignatureToScan.Length).SequenceEqual(metadataSignatureToScan))
+            {
+                var trimmedArray = new byte[byteArray.Length - index + metadataSignatureOffset];
+                Array.Copy(byteArray, index - metadataSignatureOffset, trimmedArray, 0, trimmedArray.Length);
+                if (magicToFix.Length >= 0)
+                    Array.Copy(magicToFix, 0, trimmedArray, 0, magicToFix.Length);
+
+                byteArray = trimmedArray;
+                break;
+            }
+            index = Array.IndexOf(byteArray, (byte)metadataSignatureToScan[0], index + 1);
+        }
+
+        metadataBytes = byteArray;
+    }
+
+    public static unsafe void SetModuleRegions(List<MEMORY_BASIC_INFORMATION> protectedRegions, uint? newProtection = null)
+    {
+        foreach (var region in protectedRegions)
+        {
+            var result = VirtualProtect((IntPtr)region.BaseAddress, (uint)region.RegionSize, newProtection ?? region.Protect, out _);
+            if (!result)
+            {
+                var error = Marshal.GetLastWin32Error();
+                Logger.Instance.LogError("VirtualProtect failed with error code {error}", error);
+            }
+        }
+    }
+
+    public static void ValidateMetadata(ILogger logger, string metadataPath, byte[] il2cppBytes, ref byte[] metadataBytes)
+    {
+        if (il2cppBytes == metadataBytes)
+        {
+            logger.LogWarning("global-metadata.dat is not embedded in GameAssembly.dll.");
+            if (File.Exists(metadataPath))
+            {
+                logger.LogWarning("Found global-metadata.dat at the default path, using it instead.");
+                metadataBytes = File.ReadAllBytes(metadataPath);
+            }
+            else
+            {
+                logger.LogWarning("global-metadata.dat is not found at the default location. Input file path:");
+                metadataPath = Path.Combine(Console.ReadLine() ?? string.Empty);
+                metadataBytes = File.ReadAllBytes(metadataPath);
+            }
+        }
+    }
+
+    public const uint PAGE_EXECUTE_READWRITE = 0x40;
+
     public struct SignatureDefinition
     {
         public string pattern;
         public string mask;
         public int offset;
         public bool xref;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct MEMORY_BASIC_INFORMATION
-    {
-        public IntPtr BaseAddress;
-        public IntPtr AllocationBase;
-        public uint AllocationProtect;
-        public IntPtr RegionSize;
-        public uint State;
-        public uint Protect;
-        public uint Type;
     }
 }
