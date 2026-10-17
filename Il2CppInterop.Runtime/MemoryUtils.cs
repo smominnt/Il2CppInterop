@@ -5,20 +5,26 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
-using Il2CppInterop.Common;
+using System.Text;
 using Il2CppInterop.Common.XrefScans;
 using Microsoft.Extensions.Logging;
 using TerraFX.Interop.Windows;
 
 namespace Il2CppInterop.Runtime;
 
-internal class MemoryUtils
+public class MemoryUtils
 {
     [DllImport("kernel32.dll", SetLastError = true)]
-    internal static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+    private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer,
+        int dwSize, out IntPtr lpNumberOfBytesRead);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    internal static extern bool VirtualProtect(IntPtr lpAddress, uint dwSize, uint flNewProtect, out uint lpflOldProtect);
+    private static extern bool VirtualProtect(IntPtr lpAddress, nuint dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+    // Protections that permit reading; TerraFX defines no single composite of these.
+    private const uint PageReadable = PAGE.PAGE_READONLY | PAGE.PAGE_READWRITE | PAGE.PAGE_WRITECOPY |
+                                      PAGE.PAGE_EXECUTE_READ | PAGE.PAGE_EXECUTE_READWRITE |
+                                      PAGE.PAGE_EXECUTE_WRITECOPY;
 
     public static unsafe nint FindSignatureInModule(ProcessModule module, SignatureDefinition sigDef)
     {
@@ -31,14 +37,10 @@ internal class MemoryUtils
         nint ptr = 0;
         if (OperatingSystem.IsWindowsVersionAtLeast(6, 1))
         {
-            // Protections that permit reading; TerraFX defines no single composite of these.
-            const uint pageReadable = PAGE.PAGE_READONLY | PAGE.PAGE_READWRITE | PAGE.PAGE_WRITECOPY |
-                                      PAGE.PAGE_EXECUTE_READ | PAGE.PAGE_EXECUTE_READWRITE | PAGE.PAGE_EXECUTE_WRITECOPY;
-            var regions = GetModuleRegions(module);
-            foreach (var region in regions)
+            foreach (var region in GetModuleRegions(module))
             {
                 if (region.State != MEM.MEM_COMMIT || (region.Protect & PAGE.PAGE_GUARD) != 0 ||
-                    (region.Protect & pageReadable) == 0)
+                    (region.Protect & PageReadable) == 0)
                     continue;
                 ptr = FindSignatureInBlock((nint)region.BaseAddress, (long)region.RegionSize,
                     sigDef.pattern, sigDef.mask, sigDef.offset);
@@ -91,7 +93,7 @@ internal class MemoryUtils
     /// the readable committed ones. Stops at the first <c>VirtualQuery</c> failure or once the module end is reached.
     /// </summary>
     [SupportedOSPlatform("windows6.1")]
-    internal static unsafe List<MEMORY_BASIC_INFORMATION> GetModuleRegions(ProcessModule module)
+    public static unsafe List<MEMORY_BASIC_INFORMATION> GetModuleRegions(ProcessModule module)
     {
         var regions = new List<MEMORY_BASIC_INFORMATION>();
         var moduleEndAddress = (long)module.BaseAddress + module.ModuleMemorySize;
@@ -110,92 +112,141 @@ internal class MemoryUtils
         return regions;
     }
 
+
+    /// <summary>
+    /// Reads the module region by region. Guard pages are skipped (left zeroed). Committed PAGE_NOACCESS
+    /// regions are made PAGE_READONLY just long enough to read, then restored. Readable regions are untouched.
+    /// </summary>
+    [SupportedOSPlatform("windows6.1")]
+    private static unsafe byte[] ReadModuleMemory(ILogger logger, Process process, ProcessModule module)
+    {
+        var bytes = new byte[module.ModuleMemorySize];
+        var moduleBase = (long)module.BaseAddress;
+
+        foreach (var region in GetModuleRegions(module))
+        {
+            if (region.State != MEM.MEM_COMMIT || (region.Protect & PAGE.PAGE_GUARD) != 0)
+                continue;
+
+            var start = (long)region.BaseAddress - moduleBase;
+            if (start < 0 || start >= bytes.Length)
+                continue;
+            var size = (int)Math.Min((long)region.RegionSize, bytes.Length - start);
+
+            var restore = false;
+            uint oldProtect = 0;
+            if ((region.Protect & PageReadable) == 0)
+            {
+                // PAGE_NOACCESS (or similar): temporarily make it readable
+                if (!VirtualProtect((nint)region.BaseAddress, (nuint)size, PAGE.PAGE_READONLY, out oldProtect))
+                {
+                    logger.LogDebug("Skipping unreadable region at {addr:X}", (long)region.BaseAddress);
+                    continue;
+                }
+                restore = true;
+            }
+
+            try
+            {
+                var buffer = new byte[size];
+                if (ReadProcessMemory(process.Handle, (nint)region.BaseAddress, buffer, size, out var read))
+                    Array.Copy(buffer, 0, bytes, start, (long)read);
+                else
+                    logger.LogDebug("ReadProcessMemory failed for region at {addr:X}", (long)region.BaseAddress);
+            }
+            finally
+            {
+                if (restore)
+                    VirtualProtect((nint)region.BaseAddress, (nuint)size, oldProtect, out _);
+            }
+        }
+
+        return bytes;
+    }
+
+    [SupportedOSPlatform("windows6.1")]
     public static void RuntimeModuleDump(ILogger logger, out byte[] il2cppBytes, out byte[] metadataBytes, byte[] metadataSignatureToScan, byte[] magicToFix, int metadataSignatureOffset = 252)
     {
         Process process = Process.GetCurrentProcess();
         var module = process
             .Modules.OfType<ProcessModule>()
-            .Single((x) => x.ModuleName is "GameAssembly.dll" or "GameAssembly.so" or "UserAssembly.dll");
-        if (module.ModuleName == null)
+            .SingleOrDefault(x => x.ModuleName is "GameAssembly.dll" or "GameAssembly.so" or "UserAssembly.dll");
+        if (module?.ModuleName == null)
         {
             logger.LogError("GameAssembly.dll or GameAssembly.so or UserAssembly.dll not found");
             il2cppBytes = [];
             metadataBytes = [];
             return;
         }
-        var moduleBytes = new byte[module.ModuleMemorySize];
 
-        // Directly use TerraFX regions without translation projection
-        var regions = GetModuleRegions(module);
-
-        SetModuleRegions(regions, PAGE_EXECUTE_READWRITE);
-        if (!ReadProcessMemory(process.Handle, module.BaseAddress, moduleBytes, module.ModuleMemorySize, out _))
-        {
-            logger.LogError("Failed to read process memory");
-            il2cppBytes = [];
-            metadataBytes = [];
-            return;
-        }
-        SetModuleRegions(regions);
+        var moduleBytes = ReadModuleMemory(logger, process, module);
 
         using (var stream = new MemoryStream(moduleBytes))
         using (var reader = new BinaryReader(stream))
         using (var writer = new BinaryWriter(stream))
         {
+            // Parse the PE header to get the section headers
             stream.Position = 0x3C;
             var peHeaderOffset = reader.ReadInt32();
+            logger.LogDebug("peHeaderOffset: {peHeaderOffset}", peHeaderOffset);
             stream.Position = peHeaderOffset + 6;
             var numberOfSections = reader.ReadUInt16();
+            var timeDateStame = reader.ReadUInt32();
+            var pointerToSymbolTable = reader.ReadUInt32();
+            var numberOfSymbols = reader.ReadUInt32();
             var sizeOfOptionalHeader = reader.ReadUInt16();
+            var characteristics = reader.ReadUInt16();
             var section0StartPosition = (int)stream.Position + sizeOfOptionalHeader;
 
+            // Update each section header's PointerToRawData and SizeOfRawData fields
+            logger.LogDebug("numberOfSections: {numberOfSections}", numberOfSections);
             for (var i = 0; i < numberOfSections; i++)
             {
                 stream.Position = section0StartPosition + (i * 40);
+                var sectionNameBytes = reader.ReadBytes(8);
+                var sectionName = Encoding.ASCII.GetString(sectionNameBytes).TrimEnd('\0');
                 var virtualSize = reader.ReadUInt32();
                 var virtualAddress = reader.ReadUInt32();
+                logger.LogDebug("{sectionName}: VirtualSize {virtualSize:X} VirtualAddress {virtualAddress:X}", sectionName, virtualSize, virtualAddress);
                 writer.Write(virtualSize);
                 writer.Write(virtualAddress);
             }
         }
 
+        logger.LogDebug("Processed {module.ModuleName}", module.ModuleName);
         il2cppBytes = moduleBytes;
+
         var byteArray = moduleBytes;
 
-        var index = Array.IndexOf(byteArray, (byte)metadataSignatureToScan[0]);
+        // search for pattern in the byte array
+        var index = Array.IndexOf(byteArray, metadataSignatureToScan[0]);
         while (index >= 0 && index <= byteArray.Length - metadataSignatureToScan.Length)
         {
-            if (byteArray.Skip(index).Take(metadataSignatureToScan.Length).SequenceEqual(metadataSignatureToScan))
+            if (byteArray.AsSpan(index, metadataSignatureToScan.Length).SequenceEqual(metadataSignatureToScan))
             {
+                // pattern found, trim everything before it
                 var trimmedArray = new byte[byteArray.Length - index + metadataSignatureOffset];
+                // copy the metadata bytes
                 Array.Copy(byteArray, index - metadataSignatureOffset, trimmedArray, 0, trimmedArray.Length);
-                if (magicToFix.Length >= 0)
+                // this is required for il2cppdumper to work
+                if (magicToFix.Length > 0)
                     Array.Copy(magicToFix, 0, trimmedArray, 0, magicToFix.Length);
 
                 byteArray = trimmedArray;
                 break;
             }
-            index = Array.IndexOf(byteArray, (byte)metadataSignatureToScan[0], index + 1);
+            index = Array.IndexOf(byteArray, metadataSignatureToScan[0], index + 1);
         }
 
+        logger.LogDebug("Processed global-metadata.dat");
         metadataBytes = byteArray;
-    }
-
-    public static unsafe void SetModuleRegions(List<MEMORY_BASIC_INFORMATION> protectedRegions, uint? newProtection = null)
-    {
-        foreach (var region in protectedRegions)
-        {
-            var result = VirtualProtect((IntPtr)region.BaseAddress, (uint)region.RegionSize, newProtection ?? region.Protect, out _);
-            if (!result)
-            {
-                var error = Marshal.GetLastWin32Error();
-                Logger.Instance.LogError("VirtualProtect failed with error code {error}", error);
-            }
-        }
+        return;
     }
 
     public static void ValidateMetadata(ILogger logger, string metadataPath, byte[] il2cppBytes, ref byte[] metadataBytes)
     {
+        //metadataBytes will equal il2cppBytes if the search pattern did not match.
+        //In this case, global-metadata.dat is not embedded in GameAssembly.dll and most likely at the default path.
         if (il2cppBytes == metadataBytes)
         {
             logger.LogWarning("global-metadata.dat is not embedded in GameAssembly.dll.");
@@ -206,14 +257,14 @@ internal class MemoryUtils
             }
             else
             {
-                logger.LogWarning("global-metadata.dat is not found at the default location. Input file path:");
+                logger.LogWarning("global-meatadata.dat is not found at the default location. " +
+                    "It may be hidden somewhere else. " +
+                    "\n Input the file path: (Example: C:\\Users\\_\\<YourGame>\\fake-global-metadata-name.fakeExtension");
                 metadataPath = Path.Combine(Console.ReadLine() ?? string.Empty);
                 metadataBytes = File.ReadAllBytes(metadataPath);
             }
         }
     }
-
-    public const uint PAGE_EXECUTE_READWRITE = 0x40;
 
     public struct SignatureDefinition
     {
